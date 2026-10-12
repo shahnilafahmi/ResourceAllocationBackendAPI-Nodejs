@@ -1,0 +1,158 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// The tables below already exist in the "ResourceAllocation-Test" database
+// (created by hand-written SQL). This file mirrors them; prefer `prisma db pull`
+// over `prisma migrate` to keep it in sync.
+//
+// Not expressible in Prisma, enforced in the DB and mirrored in the zod schemas:
+//   - CHECK constraints (see each module's *.schema.ts)
+//   - partial index idx_allocations_expiration
+//     (expires_at WHERE expires_at IS NOT NULL AND is_voided = FALSE)
+
+// 1. OPERATOR TIERS
+model OperatorTier {
+  id               BigInt                   @id @default(autoincrement()) @map("tier_id")
+  tierName         String                   @unique @map("tier_name") @db.VarChar(50)
+  // Postgres INTERVAL has no native Prisma type; read/write it with raw SQL.
+  expirationWindow Unsupported("interval")  @map("expiration_window")
+  isActive         Boolean                  @default(true) @map("is_active")
+  createdAt        DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  operators   Operator[]
+  allocations ResourceAllocation[]
+
+  @@map("operator_tiers")
+}
+
+// 2. OPERATORS
+model Operator {
+  id        BigInt   @id @default(autoincrement()) @map("operator_id")
+  fullName  String   @map("full_name") @db.VarChar(150)
+  email     String?  @unique @db.VarChar(255)
+  tierId    BigInt   @map("tier_id")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  tier                  OperatorTier          @relation(fields: [tierId], references: [id])
+  balance               OperatorBalance?
+  allocations           ResourceAllocation[]  @relation("AllocationOperator")
+  createdAllocations    ResourceAllocation[]  @relation("AllocationCreatedBy")
+  adjustments           SupervisorAdjustment[] @relation("AdjustmentOperator")
+  supervisedAdjustments SupervisorAdjustment[] @relation("AdjustmentSupervisor")
+  activityLogs          ActivityLog[]         @relation("ActivityOperator")
+  actedActivityLogs     ActivityLog[]         @relation("ActivityActor")
+
+  @@map("operators")
+}
+
+// 3. STATUS LEVELS
+model StatusLevel {
+  id        BigInt   @id @default(autoincrement()) @map("status_level_id")
+  name      String   @unique @map("status_name") @db.VarChar(50)
+  minUnits  Decimal  @map("min_units") @db.Decimal(14, 2)
+  maxUnits  Decimal? @map("max_units") @db.Decimal(14, 2)
+  priority  Int      @default(1)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  balances OperatorBalance[]
+
+  @@map("status_levels")
+}
+
+// 4. OPERATOR BALANCES
+model OperatorBalance {
+  operatorId           BigInt   @id @map("operator_id")
+  currentUnits         Decimal  @default(0) @map("current_units") @db.Decimal(14, 2)
+  currentStatusLevelId BigInt?  @map("current_status_level_id")
+  // Optimistic-locking counter: increment on every write.
+  version              BigInt   @default(0)
+  updatedAt            DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  operator    Operator     @relation(fields: [operatorId], references: [id])
+  statusLevel StatusLevel? @relation(fields: [currentStatusLevelId], references: [id])
+
+  @@map("operator_balances")
+}
+
+// 5. RESOURCE ALLOCATIONS
+model ResourceAllocation {
+  id             BigInt    @id @default(autoincrement()) @map("allocation_id")
+  operatorId     BigInt    @map("operator_id")
+  // Positive adds units, negative removes units. Never zero.
+  unitsDelta     Decimal   @map("units_delta") @db.Decimal(14, 2)
+  // NORMAL | SUPERVISOR_ADJUSTMENT | EXPIRATION
+  allocationType String    @default("NORMAL") @map("allocation_type") @db.VarChar(30)
+  effectiveAt    DateTime  @default(now()) @map("effective_at") @db.Timestamptz(6)
+  expiresAt      DateTime? @map("expires_at") @db.Timestamptz(6)
+  // Tier in force when the allocation was created.
+  tierId         BigInt?   @map("tier_id")
+  createdBy      BigInt?   @map("created_by")
+  idempotencyKey String?   @unique @map("idempotency_key") @db.Uuid
+  isVoided       Boolean   @default(false) @map("is_voided")
+  voidedAt       DateTime? @map("voided_at") @db.Timestamptz(6)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  operator    Operator               @relation("AllocationOperator", fields: [operatorId], references: [id])
+  tier        OperatorTier?          @relation(fields: [tierId], references: [id])
+  creator     Operator?              @relation("AllocationCreatedBy", fields: [createdBy], references: [id])
+  adjustments SupervisorAdjustment[]
+  activityLogs ActivityLog[]
+
+  @@index([operatorId, effectiveAt], map: "idx_allocations_operator_effective")
+  @@index([expiresAt], map: "idx_allocations_expiration")
+  @@map("resource_allocations")
+}
+
+// 6. SUPERVISOR ADJUSTMENTS
+model SupervisorAdjustment {
+  id                  BigInt    @id @default(autoincrement()) @map("adjustment_id")
+  operatorId          BigInt    @map("operator_id")
+  allocationId        BigInt    @map("allocation_id")
+  supervisorId        BigInt    @map("supervisor_id")
+  adjustmentDelta     Decimal   @map("adjustment_delta") @db.Decimal(14, 2)
+  effectiveAt         DateTime  @map("effective_at") @db.Timestamptz(6)
+  reason              String
+  // PENDING | PROCESSING | COMPLETED | FAILED
+  recalculationStatus String    @default("PENDING") @map("recalculation_status") @db.VarChar(20)
+  recalculatedAt      DateTime? @map("recalculated_at") @db.Timestamptz(6)
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  operator     Operator           @relation("AdjustmentOperator", fields: [operatorId], references: [id])
+  allocation   ResourceAllocation @relation(fields: [allocationId], references: [id])
+  supervisor   Operator           @relation("AdjustmentSupervisor", fields: [supervisorId], references: [id])
+  activityLogs ActivityLog[]
+
+  @@index([recalculationStatus, effectiveAt], map: "idx_adjustments_recalculation")
+  @@index([operatorId, effectiveAt], map: "idx_adjustments_operator")
+  @@map("supervisor_adjustments")
+}
+
+// 7. ACTIVITY LOGS
+model ActivityLog {
+  id           BigInt   @id @default(autoincrement()) @map("activity_id")
+  operatorId   BigInt   @map("operator_id")
+  actorId      BigInt?  @map("actor_id")
+  allocationId BigInt?  @map("allocation_id")
+  adjustmentId BigInt?  @map("adjustment_id")
+  actionType   String   @map("action_type") @db.VarChar(50)
+  description  String?
+  metadata     Json     @default("{}") @db.JsonB
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  operator   Operator              @relation("ActivityOperator", fields: [operatorId], references: [id])
+  actor      Operator?             @relation("ActivityActor", fields: [actorId], references: [id])
+  allocation ResourceAllocation?   @relation(fields: [allocationId], references: [id])
+  adjustment SupervisorAdjustment? @relation(fields: [adjustmentId], references: [id])
+
+  @@index([operatorId, createdAt(sort: Desc)], map: "idx_activity_operator_created")
+  @@index([createdAt(sort: Desc)], map: "idx_activity_created")
+  @@map("activity_logs")
+}
